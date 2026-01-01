@@ -4,9 +4,6 @@ from firebase_admin import credentials, firestore
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
-
-# Thanks to Gemini! I have absolutely 0 experience whatsoever with firebase and stuff!
-
 # 1. Initialize Flask
 app = Flask(__name__)
 CORS(app)  # Allows your frontend to talk to this backend
@@ -109,4 +106,58 @@ def transfer_money():
 
         # SECURITY CHECK: PREVENT SELF/ALT TRANSFER
         # If both accounts have the exact same IP Hash, block it.
-        if
+        if sender_data.get('ip_hash') == receiver_data.get('ip_hash'):
+            return jsonify({"error": "Illegal Transfer: You cannot send money to an account on the same network."}), 403
+
+        # CHECK BALANCE
+        if sender_data.get('balance', 0) < amount:
+            return jsonify({"error": "Insufficient funds"}), 400
+
+        # EXECUTE TRANSFER (Atomic Transaction)
+        # This ensures money isn't lost if the server crashes halfway
+        transaction = db.transaction()
+        
+        @firestore.transactional
+        def update_in_transaction(transaction, sender_ref, receiver_ref, amount):
+            transaction.update(sender_ref, {"balance": firestore.Increment(-amount)})
+            transaction.update(receiver_ref, {"balance": firestore.Increment(amount)})
+
+        update_in_transaction(transaction, sender_ref, receiver_ref, amount)
+
+        return jsonify({"success": True, "message": f"Transferred {amount} to {receiver}"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# UPDATE IP ENDPOINT
+@app.route('/update_ip', methods=['POST'])
+def update_ip():
+    data = request.json
+    username = data.get('username')
+    new_ip_hash = data.get('new_ip_hash')
+    # In a real app, you should verify a password here!
+    
+    if not username or not new_ip_hash:
+        return jsonify({"error": "Missing data"}), 400
+
+    try:
+        user_ref = db.collection('users').document(username)
+        # Check if user exists
+        if not user_ref.get().exists:
+             return jsonify({"error": "User not found"}), 404
+             
+        # Update the IP
+        user_ref.update({"ip_hash": new_ip_hash})
+        
+        return jsonify({"success": True, "message": "IP Hash updated successfully"})
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# --- SERVER STARTUP ---
+if __name__ == '__main__':
+    # This ensures it works on both Local (5000) and Render (Environmental Variable)
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port)
