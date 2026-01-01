@@ -1,258 +1,112 @@
 import os
-import datetime
-import hashlib
-import requests
-import time
-from flask import Flask, request, jsonify
-from flask_cors import CORS
 import firebase_admin
 from firebase_admin import credentials, firestore
-import scratchattach as sa
+from flask import Flask, request, jsonify
+from flask_cors import CORS
 
-# Note that this was written 100% by Gemini since I have NO experience whatsoever with doing firebase stuff.
 
-# --- CONFIGURATION ---
-base_path = os.path.dirname(os.path.abspath(__file__))
-key_path = os.path.join(base_path, "serviceAccountKey.json")
+# Thanks to Gemini! I have absolutely 0 experience whatsoever with firebase and stuff!
 
-# --- FIREBASE INIT ---
-if not firebase_admin._apps:
-    try:
-        cred = credentials.Certificate(key_path)
-        firebase_admin.initialize_app(cred)
-        print(f"SUCCESS: Loaded key from {key_path}")
-    except FileNotFoundError:
-        print(f"ERROR: Could not find file at {key_path}")
-        exit(1)
-
-db = firestore.client()
+# 1. Initialize Flask
 app = Flask(__name__)
-CORS(app) # Allow cross-origin requests from your frontend
+CORS(app)  # Allows your frontend to talk to this backend
 
-# --- CONSTANTS ---
-ADMIN_USERNAME = "-GeometricalCoder-"
-AUTH_PROJECT_ID = "1260682528"
-
-# --- HELPER FUNCTIONS ---
-
-def hash_IP(ip):
-    """Hashes IP to preserve privacy while allowing alts detection."""
-    if not ip:
-        return "unknown"
-    cut_ip = ip[2:] if len(ip) > 2 else ip
-    return hashlib.sha256(cut_ip.encode()).hexdigest()[:10]
-
-def get_config():
-    """Fetches global config."""
-    ref = db.collection("config").document("global").get()
-    if ref.exists:
-        return ref.to_dict()
-    return {"isLocked": False, "lockMessage": ""}
+# 2. Initialize Firebase Database
+# ⚠️ MAKE SURE YOU HAVE 'serviceAccountKey.json' in your folder or set up via Env Vars
+# If you haven't set up the key yet, this part will error until you do.
+try:
+    if not firebase_admin._apps:
+        # Check if we are on Render (using environment variable) or local
+        if os.environ.get('FIREBASE_KEY'):
+            # If you pasted your JSON content into a Render Env Var called FIREBASE_KEY
+            import json
+            cred_info = json.loads(os.environ.get('FIREBASE_KEY'))
+            cred = credentials.Certificate(cred_info)
+        else:
+            # Local fallback (looks for file)
+            cred = credentials.Certificate("serviceAccountKey.json")
+            
+        firebase_admin.initialize_app(cred)
+    
+    db = firestore.client()
+except Exception as e:
+    print(f"Warning: Firebase not connected yet. Error: {e}")
+    # We continue so the app doesn't crash, but DB calls will fail.
 
 # --- ROUTES ---
 
-@app.route('/auth/verify', methods=['POST'])
-def verify_user():
-    """
-    Verifies user via Scratch comments.
-    Expects JSON: { "username": "user", "code": "the_code_generated_by_frontend" }
-    """
+@app.route('/')
+def home():
+    return "UPCentralBank Backend is Running!"
+
+# MINING ENDPOINT
+@app.route('/mine', methods=['POST'])
+def mine_income():
     data = request.json
     username = data.get('username')
-    code = data.get('code')
-    
-    if not username or not code:
+    time_seconds = data.get('time_seconds')
+    provided_ip_hash = data.get('ip_hash')
+
+    if not username or not time_seconds or not provided_ip_hash:
         return jsonify({"error": "Missing data"}), 400
 
     try:
-        # Use ScratchAttach to check comments on the auth project
-        comments = sa.get_project(AUTH_PROJECT_ID).comments(limit=20)
-        verified = False
-        
-        for comment in comments:
-            # Check if the specific user commented the specific code
-            if comment['author']['username'].lower() == username.lower() and code in comment['content']:
-                verified = True
-                break
-        
-        if not verified:
-            return jsonify({"success": False, "message": "Verification code not found in recent comments."}), 401
-
-        # Check if user exists in DB, if not, register them
-        user_ref = db.collection("users").document(username)
+        # Get user from DB
+        user_ref = db.collection('users').document(username)
         user_doc = user_ref.get()
-        
+
         if not user_doc.exists:
-            # REGISTER NEW USER
-            join_activity = {
-                "type": 1, # 1 = Join
-                "args": {"user": username},
-                "date": datetime.datetime.now().isoformat()
-            }
-            new_user_data = {
-                "username": username,
-                "uid": str(sa.get_user(username).id), 
-                "ipHash": hash_IP(request.remote_addr),
-                "balance": 1000.0,
-                "bio": "New to UP Currency!",
-                "country": "Unknown", # You can use a geolocation API here if needed
-                "joinDate": datetime.datetime.now().isoformat(),
-                "activity": [join_activity],
-                "warning": None
-            }
-            user_ref.set(new_user_data)
-            return jsonify({"success": True, "message": "Account created!", "data": new_user_data})
-        else:
-            # LOGIN EXISTING
-            # Update IP hash on login
-            user_ref.update({"ipHash": hash_IP(request.remote_addr)})
-            return jsonify({"success": True, "message": "Logged in successfully", "data": user_doc.to_dict()})
+            return jsonify({"error": "User not found"}), 404
 
-    except Exception as e:
-        print(f"Auth Error: {e}")
-        return jsonify({"error": "Authentication server error"}), 500
+        user_data = user_doc.to_dict()
+        stored_ip_hash = user_data.get('ip_hash')
 
-@app.route('/user/data', methods=['GET'])
-def get_user_data():
-    """Gets data for a specific user."""
-    username = request.args.get('username')
-    if not username:
-        return jsonify({"error": "Username required"}), 400
+        # SECURITY CHECK: IP HASH
+        if stored_ip_hash != provided_ip_hash:
+            return jsonify({"error": "Security Alert: IP Mismatch. Mining rejected."}), 403
+
+        # CALCULATE REWARD (Example: 1 Coin per second)
+        # You can change the multiplier here
+        reward = int(time_seconds) * 1 
         
-    doc = db.collection("users").document(username).get()
-    if doc.exists:
-        return jsonify(doc.to_dict())
-    return jsonify({"error": "User not found"}), 404
+        # Update Balance
+        # Uses Firestore increment for safety
+        user_ref.update({"balance": firestore.Increment(reward)})
 
-@app.route('/transaction/send', methods=['POST'])
-def send_currency():
-    """
-    Handles money transfer.
-    Expects: { "sender": "userA", "recipient": "userB", "amount": 50, "auth_code": "..." }
-    """
-    # NOTE: In a real app, you would verify an auth token here, not just trust the "sender" field.
-    # For this implementation, we assume the frontend has verified the user.
-    
-    data = request.json
-    sender_id = data.get('sender')
-    recipient_id = data.get('recipient')
-    try:
-        amount = float(data.get('amount'))
-    except:
-        return jsonify({"error": "Invalid amount"}), 400
-
-    # 1. Basic Validation
-    if amount <= 0:
-        return jsonify({"error": "Amount must be positive"}), 400
-    if sender_id == recipient_id:
-        return jsonify({"error": "Cannot send money to yourself"}), 400
-
-    # 2. Global Lock Check
-    config = get_config()
-    if config.get("isLocked"):
-        return jsonify({"error": f"System Locked: {config.get('lockMessage')}"}), 503
-
-    # 3. Transaction (Atomic Operation)
-    transaction = db.transaction()
-    sender_ref = db.collection("users").document(sender_id)
-    recipient_ref = db.collection("users").document(recipient_id)
-
-    try:
-        result = handle_transfer(transaction, sender_ref, recipient_ref, amount, sender_id)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
-
-@firestore.transactional
-def handle_transfer(transaction, sender_ref, recipient_ref, amount, sender_id):
-    """Safe atomic transfer."""
-    sender_snapshot = sender_ref.get(transaction=transaction)
-    recipient_snapshot = recipient_ref.get(transaction=transaction)
-
-    if not sender_snapshot.exists:
-        raise Exception("Sender does not exist")
-    if not recipient_snapshot.exists:
-        raise Exception("Recipient does not exist")
-
-    sender_data = sender_snapshot.to_dict()
-    current_balance = sender_data.get("balance", 0)
-
-    if current_balance < amount:
-        raise Exception("Insufficient funds")
-
-    # Update Balances
-    transaction.update(sender_ref, {"balance": current_balance - amount})
-    transaction.update(recipient_ref, {"balance": recipient_snapshot.get("balance", 0) + amount})
-    
-    # Log Activity (Optional: Add to activity array)
-    timestamp = datetime.datetime.now().isoformat()
-    # Note: Adding to array in transaction is tricky without array_union, simplified here:
-    return {"success": True, "new_balance": current_balance - amount}
-
-# --- ADMIN ACTIONS ---
-
-@app.route('/admin/warn', methods=['POST'])
-def warn_user():
-    """
-    Sets a warning for a user.
-    Expects: { "admin": "admin_user", "target": "target_user", "message": "Stop spamming" }
-    """
-    data = request.json
-    admin = data.get('admin')
-    target = data.get('target')
-    message = data.get('message')
-
-    # Security Check
-    if admin != ADMIN_USERNAME:
-         return jsonify({"error": "Unauthorized"}), 403
-    
-    db.collection("users").document(target).update({"warning": message})
-    return jsonify({"success": True, "message": f"Warning set for {target}"})
-
-@app.route('/user/dismiss_warning', methods=['POST'])
-def dismiss_warning():
-    """Clears the warning from the database (User clicked 'Don't show again')."""
-    data = request.json
-    username = data.get('username')
-    
-    # Set warning to None
-    db.collection("users").document(username).update({"warning": None})
-    return jsonify({"success": True})
-
-@app.route('/user/delete', methods=['POST'])
-def delete_account():
-    """Deletes the user account."""
-    data = request.json
-    username = data.get('username')
-    # In production, verify auth_code/session here!
-    
-    db.collection("users").document(username).delete()
-    return jsonify({"success": True, "message": "Account deleted."})
-
-# --- LEADERBOARD ---
-
-@app.route('/leaderboard', methods=['GET'])
-def get_leaderboard():
-    """
-    Returns sorted leaderboard.
-    Handles the 'Max 3 ties' visual requirement logic.
-    """
-    # Fetch all users (Limit this if you have >1000 users)
-    users_ref = db.collection("users").order_by("balance", direction=firestore.Query.DESCENDING).stream()
-    
-    leaderboard = []
-    for doc in users_ref:
-        u = doc.to_dict()
-        leaderboard.append({
-            "username": u.get("username"),
-            "balance": u.get("balance"),
-            "country": u.get("country")
+        return jsonify({
+            "success": True, 
+            "reward": reward, 
+            "message": f"Mined {reward} coins for {time_seconds} seconds."
         })
 
-    # Tie Logic: Group users by balance
-    # Note: Backend sends the data; Frontend should usually handle the "Max 3 ties" display.
-    # But here is raw sorted data.
-    return jsonify(leaderboard)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000)
+
+# TRANSFER ENDPOINT (Anti-Alt Account)
+@app.route('/transfer', methods=['POST'])
+def transfer_money():
+    data = request.json
+    sender = data.get('sender')
+    receiver = data.get('receiver')
+    amount = data.get('amount')
+
+    if not sender or not receiver or not amount:
+        return jsonify({"error": "Missing data"}), 400
+
+    try:
+        sender_ref = db.collection('users').document(sender)
+        receiver_ref = db.collection('users').document(receiver)
+
+        sender_doc = sender_ref.get()
+        receiver_doc = receiver_ref.get()
+
+        if not sender_doc.exists or not receiver_doc.exists:
+            return jsonify({"error": "One or both users not found"}), 404
+
+        sender_data = sender_doc.to_dict()
+        receiver_data = receiver_doc.to_dict()
+
+        # SECURITY CHECK: PREVENT SELF/ALT TRANSFER
+        # If both accounts have the exact same IP Hash, block it.
+        if
